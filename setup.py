@@ -27,7 +27,7 @@ setup_args = dict(
     include_package_data=True,
     entry_points={
         'OptimizationAlgorithm': [
-            'hyperband_HyperBand = orion.algo.hyperband.hyperband:HyperBand'
+            'hyperband = orion.algo.hyperband.hyperband:Hyperband'
             ],
         },
     install_requires=['orion', 'numpy'],

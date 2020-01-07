@@ -1,5 +1,5 @@
 algorithms:
-  HyperBand: {}
+  Hyperband: {}
     # NOTE: Add arguments here if necessary
 
 database:
