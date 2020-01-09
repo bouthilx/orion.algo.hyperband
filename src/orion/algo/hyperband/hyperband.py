@@ -97,6 +97,9 @@ class Hyperband(BaseAlgorithm):
         super(Hyperband, self).__init__(
             space, seed=seed, num_rungs=num_rungs, num_brackets=num_brackets)
 
+        if num_brackets > 1:
+            raise NotImplementedError()
+
         self.trial_info = {}  # Stores Trial -> Bracket
 
         try:
@@ -127,27 +130,48 @@ class Hyperband(BaseAlgorithm):
             for bracket_index in range(num_brackets)
         ]
 
-    def sample(self, num):
-        return list(self.space.sample(num, seed=tuple(self.rng.randint(0, 1000000, size=3))))
+    def sample(self, num, bracket, buffer=10):
+        # TODO: When using more than 1 bracket, they should have different seeds 
+        #       otherwise they will all sample the same points but at different rungs.
+        samples = self.space.sample(num * buffer, seed=self.seed)
+
+        i = 0
+        points = []
+        while len(points) < num and i < num * buffer:
+            point = samples[i]
+            if self.get_id(point) not in self.trial_info:
+                point = list(point)
+                point[self.fidelity_index] = bracket.rungs[0][0]
+                points.append(tuple(point))
+            i += 1
+
+        if len(points) == 0:
+            raise RuntimeError(
+                'Hyperband keeps sampling already existing points. This should not happen, '
+                'please report this error to '
+                'https://github.com/bouthilx/orion.algo.hyperband/issues')
+
+        return points
 
     def seed_rng(self, seed):
         """Seed the state of the random number generator.
 
         :param seed: Integer seed for the random number generator.
         """
+        self.seed = seed
         self.rng = numpy.random.RandomState(seed)
 
     @property
     def state_dict(self):
         """Return a state dict that can be used to reset the state of the algorithm."""
-        return {'rng_state': self.rng.get_state()}
+        return {'rng_state': self.rng.get_state(), 'seed': self.seed}
 
     def set_state(self, state_dict):
         """Reset the state of the algorithm based on the given state_dict
 
         :param state_dict: Dictionary representing state of an algorithm
         """
-        self.seed_rng(0)
+        self.seed_rng(state_dict['seed'])
         self.rng.set_state(state_dict['rng_state'])
 
     def suggest(self, num=1):
@@ -175,13 +199,13 @@ class Hyperband(BaseAlgorithm):
 
         for bracket in self.brackets:
             if not bracket.is_filled:
-                return [tuple(bracket.sample())]
+                return bracket.sample()
 
         # All brackets are filled
 
         for bracket in self.brackets:
             if bracket.is_ready():
-                return [tuple(bracket.promote())]
+                return bracket.promote()
 
         # Either all brackets are done or none are ready and algo needs to wait for some trials to
         # complete
@@ -276,9 +300,9 @@ class Bracket():
 
     def sample(self):
         """Sample a new trial with lowest fidelity"""
-        point = list(self.hyperband.sample(1)[0])
-        point[self.hyperband.fidelity_index] = self.rungs[0][0]
-        return point
+        n_trials = len(self.rungs[0][1])
+        should_have_n_trials = compute_rung_sizes(self.reduction_factor, len(self.rungs))[0]
+        return self.hyperband.sample(should_have_n_trials - n_trials, self)
 
     def register(self, point, objective):
         """Register a point in the corresponding rung"""
@@ -291,24 +315,28 @@ class Bracket():
 
         rungs[0][self.hyperband.get_id(point)] = (objective, point)
 
-    def get_candidate(self, rung_id):
+    def get_candidates(self, rung_id):
         """Get a candidate for promotion"""
         if self.has_rung_filled(rung_id + 1):
-            return None
+            return []
 
         _, rung = self.rungs[rung_id]
         next_rung = self.rungs[rung_id + 1][1]
 
         rung = list(sorted((objective, point) for objective, point in rung.values()))
 
-        for trial in rung:
-            objective, point = trial
+        should_have_n_trials = compute_rung_sizes(self.reduction_factor, len(self.rungs))[rung_id + 1]
+        points = []
+        i = 0
+        while len(points) + len(next_rung) < should_have_n_trials:
+            objective, point = rung[i]
             assert objective is not None
             _id = self.hyperband.get_id(point)
             if _id not in next_rung:
-                return point
+                points.append(point)
+            i += 1
 
-        return None
+        return points
 
     @property
     def is_done(self):
@@ -359,9 +387,8 @@ class Bracket():
             if not self.is_ready(rung_id):
                 return None
 
-            candidate = self.get_candidate(rung_id)
-            if candidate:
-
+            points = []
+            for candidate in self.get_candidates(rung_id):
                 # pylint: disable=logging-format-interpolation
                 logger.debug(
                     'Promoting {point} from rung {past_rung} with fidelity {past_fidelity} to '
@@ -372,8 +399,9 @@ class Bracket():
 
                 candidate = list(copy.deepcopy(candidate))
                 candidate[self.hyperband.fidelity_index] = self.rungs[rung_id + 1][0]
+                points.append(tuple(candidate))
 
-                return tuple(candidate)
+            return points
 
         return None
 
