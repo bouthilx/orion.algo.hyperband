@@ -38,26 +38,22 @@ Cannot build budgets below max_resources;
 (max: {}) - (min: {}) > (num_rungs: {})
 """
 
+def compute_budgets(max_resources, reduction_factor): 
+    num_brackets = int(numpy.log(max_resources) / numpy.log(reduction_factor))
+    B = (num_brackets + 1) * max_resources
+    budgets = []
+    for bracket_id in range(0, num_brackets + 1):
+        bracket_budgets = []
+        num_trials = B / max_resources * reduction_factor ** (num_brackets - bracket_id)
+        min_resources = max_resources / reduction_factor ** (num_brackets - bracket_id)
+        for i in range(0, num_brackets - bracket_id + 1):
+            n_i = int(num_trials / reduction_factor ** i)
+            min_i = int(numpy.ceil(min_resources * reduction_factor ** i))
+            bracket_budgets.append((n_i, min_i))
 
-def compute_budgets(min_resources, max_resources, reduction_factor, num_rungs):
-    """Compute the budgets used for Hyperband"""
-    budgets = numpy.logspace(
-        numpy.log(min_resources) / numpy.log(reduction_factor),
-        numpy.log(max_resources) / numpy.log(reduction_factor),
-        num_rungs, base=reduction_factor).astype(int)
+        budgets.append(bracket_budgets)
 
-    for i in range(num_rungs - 1):
-        if budgets[i] >= budgets[i + 1]:
-            budgets[i + 1] = budgets[i] + 1
-
-    if budgets[-1] > max_resources:
-        raise ValueError(BUDGET_ERROR.format(min_resources, max_resources, num_rungs))
-
-    return list(budgets)
-
-
-def compute_rung_sizes(reduction_factor, num_rungs):
-    return [reduction_factor**i for i in range(num_rungs)][::-1]
+    return budgets
 
 
 class Hyperband(BaseAlgorithm):
@@ -79,26 +75,12 @@ class Hyperband(BaseAlgorithm):
     seed: None, int or sequence of int
         Seed for the random number generator used to sample new trials.
         Default: ``None``
-    num_rungs: int, optional
-        Number of rungs for the largest bracket. If not defined, it will be equal to (base + 1) of
-        the fidelity dimension. In the original paper,
-        num_rungs == log(fidelity.high/fidelity.low) / log(fidelity.base) + 1.
-        Default: log(fidelity.high/fidelity.low) / log(fidelity.base) + 1
-    num_brackets: int
-        Using a grace period that is too small may bias Hyperband too strongly towards
-        fast converging trials that do not lead to best results at convergence (stagglers). To
-        overcome this, you can increase the number of brackets, which increases the amount of
-        resource required for optimisation but decreases the bias towards stragglers.
-        Default: 1
 
     """
 
-    def __init__(self, space, seed=None, num_rungs=None, num_brackets=1):
-        super(Hyperband, self).__init__(
-            space, seed=seed, num_rungs=num_rungs, num_brackets=num_brackets)
-
-        if num_brackets > 1:
-            raise NotImplementedError()
+    def __init__(self, space, seed=None):
+        self.brackets = []
+        super(Hyperband, self).__init__(space, seed=seed)
 
         self.trial_info = {}  # Stores Trial -> Bracket
 
@@ -116,24 +98,18 @@ class Hyperband(BaseAlgorithm):
         if reduction_factor < 2:
             raise AttributeError("Reduction factor for Hyperband needs to be at least 2.")
 
-        if num_rungs is None:
-            num_rungs = int(numpy.log(max_resources / min_resources) /
-                            numpy.log(reduction_factor) + 1)
-
-        self.num_rungs = num_rungs
-
-        budgets = compute_budgets(min_resources, max_resources, reduction_factor, num_rungs)
+        budgets = compute_budgets(max_resources, reduction_factor)
 
         # Tracks state for new trial add
         self.brackets = [
-            Bracket(self, reduction_factor, budgets[bracket_index:])
-            for bracket_index in range(num_brackets)
+            Bracket(self, bracket_budgets)
+            for bracket_budgets in budgets
         ]
 
+        self.seed_rng(seed)
+
     def sample(self, num, bracket, buffer=10):
-        # TODO: When using more than 1 bracket, they should have different seeds 
-        #       otherwise they will all sample the same points but at different rungs.
-        samples = self.space.sample(num * buffer, seed=self.seed)
+        samples = self.space.sample(num * buffer, seed=bracket.seed)
 
         i = 0
         points = []
@@ -141,7 +117,7 @@ class Hyperband(BaseAlgorithm):
             point = samples[i]
             if self.get_id(point) not in self.trial_info:
                 point = list(point)
-                point[self.fidelity_index] = bracket.rungs[0][0]
+                point[self.fidelity_index] = bracket.rungs[0]['resources']
                 points.append(tuple(point))
             i += 1
 
@@ -159,6 +135,8 @@ class Hyperband(BaseAlgorithm):
         :param seed: Integer seed for the random number generator.
         """
         self.seed = seed
+        for i, bracket in enumerate(self.brackets):
+            bracket.seed_rng(seed + i if seed is not None else None)
         self.rng = numpy.random.RandomState(seed)
 
     @property
@@ -197,15 +175,22 @@ class Hyperband(BaseAlgorithm):
         if num > 1:
             raise ValueError("Hyperband should suggest only one point.")
 
-        for bracket in self.brackets:
+        samples = []
+        for bracket in reversed(self.brackets):
             if not bracket.is_filled:
-                return bracket.sample()
+                samples += bracket.sample()
+
+        if samples:
+            return samples
 
         # All brackets are filled
 
-        for bracket in self.brackets:
-            if bracket.is_ready():
-                return bracket.promote()
+        for bracket in reversed(self.brackets):
+            if bracket.is_ready() and not bracket.is_done:
+                samples += bracket.promote()
+
+        if samples:
+            return samples
 
         # Either all brackets are done or none are ready and algo needs to wait for some trials to
         # complete
@@ -233,7 +218,7 @@ class Hyperband(BaseAlgorithm):
             if not bracket:
                 fidelity = point[self.fidelity_index]
                 brackets = [bracket for bracket in self.brackets
-                            if bracket.rungs[0][0] == fidelity]
+                            if bracket.rungs[0]['resources'] == fidelity]
                 if not brackets:
                     raise ValueError(
                         "No bracket found for point {0} with fidelity {1}".format(_id, fidelity))
@@ -273,21 +258,19 @@ class Bracket():
     ----------
     hyperband: `Hyperband` algorithm
         The hyperband algorithm object which this bracket will be part of.
-    reduction_factor: int
-        The factor by which Hyperband promotes trials. If the reduction factor is 4,
-        it means the number of trials from one fidelity level to the next one is roughly
-        divided by 4, and each fidelity level has 4 times more resources than the prior one.
-    budgets: list of int
-        Budgets used for each rung
+    budgets: list of tuple
+        Each tuple gives the (n_trials, resource_budget) for the respective rung
 
     """
 
-    def __init__(self, hyperband, reduction_factor, budgets):
+    def __init__(self, hyperband, budgets):
         self.hyperband = hyperband
-        self.reduction_factor = reduction_factor
-        self.rungs = [(budget, dict()) for budget in budgets]
+        self.rungs = [dict(resources=budget, n_trials=n_trials, results=dict())
+                      for n_trials, budget in budgets]
 
-        logger.debug('Bracket budgets: %s', str([rung[0] for rung in self.rungs]))
+        self.seed = None
+
+        logger.debug('Bracket budgets: %s', str(budgets))
 
         # points = hyperband.sample(compute_rung_sizes(reduction_factor, len(budgets))[0])
         # for point in points:
@@ -300,16 +283,15 @@ class Bracket():
 
     def sample(self):
         """Sample a new trial with lowest fidelity"""
-        n_trials = len(self.rungs[0][1])
-        should_have_n_trials = compute_rung_sizes(self.reduction_factor, len(self.rungs))[0]
-        return self.hyperband.sample(should_have_n_trials - n_trials, self)
+        should_have_n_trials = self.rungs[0]['n_trials']
+        return self.hyperband.sample(should_have_n_trials, self)
 
     def register(self, point, objective):
         """Register a point in the corresponding rung"""
         fidelity = point[self.hyperband.fidelity_index]
-        rungs = [rung for budget, rung in self.rungs if budget == fidelity]
+        rungs = [rung['results'] for rung in self.rungs if rung['resources'] == fidelity]
         if not rungs:
-            budgets = [budget for budget, rung in self.rungs]
+            budgets = [rung['resources'] for rung in self.rungs]
             raise IndexError(REGISTRATION_ERROR.format(fidelity=fidelity, budgets=budgets,
                                                        params=point))
 
@@ -320,12 +302,12 @@ class Bracket():
         if self.has_rung_filled(rung_id + 1):
             return []
 
-        _, rung = self.rungs[rung_id]
-        next_rung = self.rungs[rung_id + 1][1]
+        rung = self.rungs[rung_id]['results']
+        next_rung = self.rungs[rung_id + 1]['results']
 
         rung = list(sorted((objective, point) for objective, point in rung.values()))
 
-        should_have_n_trials = compute_rung_sizes(self.reduction_factor, len(self.rungs))[rung_id + 1]
+        should_have_n_trials = self.rungs[rung_id + 1]['n_trials']
         points = []
         i = 0
         while len(points) + len(next_rung) < should_have_n_trials:
@@ -341,18 +323,18 @@ class Bracket():
     @property
     def is_done(self):
         """Return True, if the last rung is filled."""
-        return len(self.rungs[-1][1])
+        return self.has_rung_filled(len(self.rungs) - 1)
 
     def has_rung_filled(self, rung_id):
         """Return True, if the rung[rung_id] is filled."""
-        n_trials = len(self.rungs[rung_id][1])
-        return n_trials >= compute_rung_sizes(self.reduction_factor, len(self.rungs))[rung_id]
+        n_trials = len(self.rungs[rung_id]['results'])
+        return n_trials >= self.rungs[rung_id]['n_trials']
 
     def is_ready(self, rung_id=None):
         if rung_id is not None:
             return (
                 self.has_rung_filled(rung_id) and
-                all(objective is not None for objective, _ in self.rungs[rung_id][1].values()))
+                all(objective is not None for objective, _ in self.rungs[rung_id]['results'].values()))
 
         is_ready = False
         for rung_id in range(len(self.rungs)):
@@ -395,16 +377,23 @@ class Bracket():
                     'rung {new_rung} with fidelity {new_fidelity}'.format(
                         point=candidate, past_rung=rung_id,
                         past_fidelity=candidate[self.hyperband.fidelity_index],
-                        new_rung=rung_id + 1, new_fidelity=self.rungs[rung_id + 1][0]))
+                        new_rung=rung_id + 1, new_fidelity=self.rungs[rung_id + 1]['resources']))
 
                 candidate = list(copy.deepcopy(candidate))
-                candidate[self.hyperband.fidelity_index] = self.rungs[rung_id + 1][0]
+                candidate[self.hyperband.fidelity_index] = self.rungs[rung_id + 1]['resources']
                 points.append(tuple(candidate))
 
             return points
 
         return None
 
+    def seed_rng(self, seed):
+        """Seed the state of the random number generator.
+
+        :param seed: Integer seed for the random number generator.
+        """
+        self.seed = seed
+
     def __repr__(self):
         """Return representation of bracket with fidelity levels"""
-        return 'Bracket({})'.format([rung[0] for rung in self.rungs])
+        return 'Bracket({})'.format([rung['resources'] for rung in self.rungs])
