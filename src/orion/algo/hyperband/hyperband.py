@@ -42,11 +42,11 @@ Cannot build budgets below max_resources;
 def compute_budgets(max_resources, reduction_factor):
     """Compute the budgets used for each execution of hyperband"""
     num_brackets = int(numpy.log(max_resources) / numpy.log(reduction_factor))
-    B = (num_brackets + 1) * max_resources
+    finite_budget = (num_brackets + 1) * max_resources
     budgets = []
     for bracket_id in range(0, num_brackets + 1):
         bracket_budgets = []
-        num_trials = B / max_resources * reduction_factor ** (num_brackets - bracket_id)
+        num_trials = finite_budget / max_resources * reduction_factor ** (num_brackets - bracket_id)
         min_resources = max_resources / reduction_factor ** (num_brackets - bracket_id)
         for i in range(0, num_brackets - bracket_id + 1):
             n_i = int(num_trials / reduction_factor ** i)
@@ -126,7 +126,7 @@ class Hyperband(BaseAlgorithm):
                 points.append(tuple(point))
             i += 1
 
-        if len(points) == 0:
+        if not points:
             raise RuntimeError(
                 'Hyperband keeps sampling already existing points. This should not happen, '
                 'please report this error to '
@@ -243,8 +243,8 @@ class Hyperband(BaseAlgorithm):
 
         if all(bracket.is_done for bracket in self.brackets):
             self.execution_times += 1
-            logger.debug('hyperband execution %i is done, required to execute %i times'
-                         % (self.execution_times, self.repeat))
+            logger.debug('hyperband execution %i is done, required to execute %i times',
+                         self.execution_times, self.repeat)
 
             # Continue to the next execution if need
             if self.execution_times < self.repeat:
@@ -361,9 +361,9 @@ class Bracket():
                     for objective, _ in self.rungs[rung_id]['results'].values()))
 
         is_ready = False
-        for rung_id in range(len(self.rungs)):
-            if self.has_rung_filled(rung_id):
-                is_ready = self.is_ready(rung_id)
+        for ith_rung_id in range(len(self.rungs)):
+            if self.has_rung_filled(ith_rung_id):
+                is_ready = self.is_ready(ith_rung_id)
             else:
                 break
 
